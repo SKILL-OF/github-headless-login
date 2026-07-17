@@ -393,8 +393,12 @@ def step_create_pat(opener, name, scopes, password=None):
 # ---------------------------------------------------------------------------
 
 def get_totp():
-    script_dir = os.path.dirname(os.path.realpath(__file__))
-    totp_script = os.path.join(script_dir, 'generate-totp.sh')
+    # generate-totp.sh lives in SKILL-OF/card-key-derivation, not this repo
+    # Check env override first, then fall back to sibling skill install
+    totp_script = os.environ.get(
+        'GENERATE_TOTP_SCRIPT',
+        os.path.expanduser('~/.local/lib/skills/card-key-derivation/scripts/generate-totp.sh')
+    )
     env = {**os.environ}   # forward AGE_KEY / TOTP_VAULT if set
     result = subprocess.run(
         ['bash', totp_script],
