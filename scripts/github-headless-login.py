@@ -285,6 +285,115 @@ def step_sudo(opener, password):
     return resp
 
 
+def step_change_password(opener, current_password, new_password):
+    """Change GitHub account password via /settings/security.
+
+    Requires an authenticated session (call after step_login + step_2fa).
+    Handles sudo re-confirmation automatically using current_password.
+    Returns True on success, raises RuntimeError on failure.
+
+    stdin protocol when called from --mode change-password:
+        line 1: current password
+        line 2: new password
+    """
+    settings_url = f'{BASE}/settings/security'
+    print("[pw] Navigating to security settings...", file=sys.stderr)
+    resp = get(opener, settings_url, referer=f'{BASE}/settings')
+    body = resp.read()
+    loc = resp.geturl()
+    print(f"    GET /settings/security → {loc}", file=sys.stderr)
+
+    # Handle sudo re-confirmation
+    if 'sessions/sudo' in loc:
+        print("    [pw] Sudo re-confirmation required...", file=sys.stderr)
+        step_sudo(opener, current_password)
+        resp = get(opener, settings_url, referer=f'{BASE}/settings')
+        body = resp.read()
+        loc = resp.geturl()
+        print(f"    GET /settings/security (after sudo) → {loc}", file=sys.stderr)
+
+    if 'login' in loc and 'settings' not in loc:
+        raise RuntimeError(f"[pw] Unexpected redirect to: {loc}")
+
+    # Find the password-change form
+    # GitHub uses action='/settings/password' or '/users/password'
+    p = AllFormsParser()
+    p.feed(body.decode('utf-8', errors='replace'))
+    print(f"    [pw] Forms found: {[(f['action'], list(f['fields'].keys())[:4]) for f in p.forms]}", file=sys.stderr)
+
+    pw_form = next(
+        (f for f in p.forms if any(
+            kw in f['action'] for kw in ('password', 'security')
+        ) and 'authenticity_token' in f['fields']),
+        None
+    )
+    if pw_form is None:
+        # Fallback: find form with user[current_password] field
+        pw_form = next(
+            (f for f in p.forms if 'user[current_password]' in f['fields']
+             or 'current_password' in f['fields']),
+            None
+        )
+    if pw_form is None:
+        raise RuntimeError(f"[pw] Password change form not found at {loc}")
+
+    fields = dict(pw_form['fields'])
+    post_url = (BASE + pw_form['action']) if pw_form['action'].startswith('/') else pw_form['action']
+
+    # Fill password fields — detect naming convention
+    if 'user[current_password]' in fields:
+        fields['user[current_password]'] = current_password
+        fields['user[password]'] = new_password
+        fields['user[password_confirmation]'] = new_password
+    elif 'current_password' in fields:
+        fields['current_password'] = current_password
+        fields['password'] = new_password
+        fields['password_confirmation'] = new_password
+    else:
+        raise RuntimeError(f"[pw] Unrecognised password field names: {list(fields.keys())}")
+
+    print(f"    [pw] POST {post_url}", file=sys.stderr)
+    resp = post(opener, post_url, fields, referer=settings_url)
+    body_text = resp.read().decode('utf-8', errors='replace')
+    loc = resp.geturl()
+    print(f"    [pw] After POST → {loc}", file=sys.stderr)
+
+    # Success indicators: redirected away from /password, or success flash
+    import re, html as _html
+    def _strip(s):
+        return _html.unescape(re.sub(r'<[^>]+>', ' ', s)).strip()
+
+    if 'password' not in loc or 'security' in loc:
+        # Likely redirected to settings page = success
+        print("[pw] Password changed successfully.", file=sys.stderr)
+        return True
+
+    # Check for success flash even if URL didn't change
+    success_blocks = re.findall(
+        r'class="[^"]*(?:flash-success|notice|success)[^"]*"[^>]*>(.*?)</(?:div|p)',
+        body_text, re.S | re.I)
+    for b in success_blocks:
+        clean = _strip(b)
+        if clean and len(clean) > 3:
+            print(f"    [pw] GitHub says: {clean[:200]}", file=sys.stderr)
+            return True
+
+    # Check for error flash
+    error_blocks = re.findall(
+        r'class="[^"]*(?:flash-error|error)[^"]*"[^>]*>(.*?)</(?:div|p)',
+        body_text, re.S | re.I)
+    errors = [_strip(b) for b in error_blocks if _strip(b)]
+    if errors:
+        raise RuntimeError(f"[pw] GitHub password change error: {errors[:2]}")
+
+    # Ambiguous — treat redirect back to settings as success
+    if 'settings' in loc:
+        print("[pw] Password change: redirected to settings (likely success).", file=sys.stderr)
+        return True
+
+    raise RuntimeError(f"[pw] Password change outcome unclear at: {loc}")
+
+
 def step_create_pat(opener, name, scopes, password=None):
     new_url = f'{BASE}/settings/tokens/new'
     print("[4/4] Creating PAT...", file=sys.stderr)
@@ -413,6 +522,21 @@ def get_totp():
 # Main
 # ---------------------------------------------------------------------------
 
+def _do_login(opener, username, password):
+    """Login + optional 2FA. Returns final URL after auth."""
+    resp = step_login(opener, username, password)
+    loc = final_url(resp)
+
+    if 'two-factor' in loc or 'sessions/two-factor' in loc:
+        resp = step_2fa(opener, debug=True)
+        loc = final_url(resp)
+
+    if 'login' in loc or 'two-factor' in loc or 'sessions' in loc:
+        raise RuntimeError(f"Authentication failed — ended up at: {loc}")
+
+    return loc
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -420,8 +544,34 @@ def main():
     ap.add_argument('--pat-name', default=os.environ.get('GH_PAT_NAME', 'aurora-agent'))
     ap.add_argument('--scopes',
                     default=os.environ.get('GH_PAT_SCOPES', 'repo,gist,read:org,workflow'))
+    ap.add_argument('--mode', choices=['issue-pat', 'change-password'],
+                    default='issue-pat',
+                    help='issue-pat (default): login + create PAT → stdout. '
+                         'change-password: login + change account password '
+                         '(stdin: line1=current password, line2=new password; '
+                         'prints "ok" to stdout on success).')
     args = ap.parse_args()
 
+    if args.mode == 'change-password':
+        current_password = sys.stdin.readline().rstrip('\n')
+        new_password     = sys.stdin.readline().rstrip('\n')
+        if not current_password or not new_password:
+            print("error: --mode change-password requires two non-empty lines on stdin "
+                  "(current password, new password)", file=sys.stderr)
+            sys.exit(1)
+
+        opener, _ = make_opener()
+        try:
+            _do_login(opener, args.username, current_password)
+            step_change_password(opener, current_password, new_password)
+        finally:
+            current_password = None
+            new_password = None
+
+        print("ok")
+        return
+
+    # Default: issue-pat
     password = sys.stdin.readline().rstrip('\n')
     if not password:
         print("error: empty password on stdin", file=sys.stderr)
@@ -433,17 +583,7 @@ def main():
     opener, _ = make_opener()
 
     try:
-        resp = step_login(opener, args.username, password)
-        loc = final_url(resp)
-
-        if 'two-factor' in loc or 'sessions/two-factor' in loc:
-            resp = step_2fa(opener, debug=True)
-            loc = final_url(resp)
-
-        # If we're still on a 2FA or login page, auth failed
-        if 'login' in loc or 'two-factor' in loc or 'sessions' in loc:
-            raise RuntimeError(f"Authentication failed — ended up at: {loc}")
-
+        _do_login(opener, args.username, password)
         pat = step_create_pat(opener, pat_name, scopes, password=password)
 
     finally:
